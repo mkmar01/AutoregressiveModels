@@ -114,26 +114,37 @@ class PatchAutoEncoder(torch.nn.Module, PatchAutoEncoderBase):
 
         def __init__(self, patch_size: int, latent_dim: int, bottleneck: int):
             super().__init__()
-            self.net = torch.nn.Sequential(
-                PatchifyLinear(patch_size, latent_dim),
-                torch.nn.GELU(),
-                torch.nn.Conv2d(latent_dim, bottleneck, 3, padding=1),
+            self.patch = PatchifyLinear(patch_size, latent_dim)   # returns NHWC
+            self.conv = torch.nn.Sequential(
+              # operate in NCHW
+              torch.nn.Conv2d(latent_dim, bottleneck, 1),
+              torch.nn.GELU(),
+              torch.nn.Conv2d(bottleneck, bottleneck, 3, padding=1),
+              torch.nn.GELU(),
             )
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:
-            return self.net(x)
+            x = self.patch(x)             # (B, h, w, latent_dim)  NHWC
+            x = x.permute(0, 3, 1, 2)     # -> (B, latent_dim, h, w) NCHW
+            x = self.conv(x)              # NCHW
+            x = x.permute(0, 2, 3, 1)     # -> (B, h, w, bottleneck) NHWC
+            return x
 
     class PatchDecoder(torch.nn.Module):
         def __init__(self, patch_size: int, latent_dim: int, bottleneck: int):
             super().__init__()
-            self.net = torch.nn.Sequential(
-                torch.nn.Conv2d(bottleneck, latent_dim, 3, padding=1),
-                torch.nn.GELU(),
-                UnpatchifyLinear(patch_size, latent_dim),
+            self.pre = torch.nn.Sequential(
+              torch.nn.Conv2d(bottleneck, latent_dim, 3, padding=1),
+              torch.nn.GELU(),
             )
+            self.unpatch = UnpatchifyLinear(patch_size, latent_dim)
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:
-            return self.net(x)
+            x = x.permute(0, 3, 1, 2)     # -> NCHW
+            x = self.pre(x)               # (B, latent_dim, h, w)
+            x = x.permute(0, 2, 3, 1)     # -> NHWC
+            x = self.unpatch(x)           # -> (B, H, W, 3) NHWC
+            return x
 
     def __init__(self, patch_size: int = 25, latent_dim: int = 128, bottleneck: int = 128):
         super().__init__()
