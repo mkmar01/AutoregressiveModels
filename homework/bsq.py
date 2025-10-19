@@ -1,6 +1,7 @@
 import abc
 
 import torch
+import torch.nn.functional as F
 
 from .ae import PatchAutoEncoder
 
@@ -46,7 +47,11 @@ class Tokenizer(abc.ABC):
 class BSQ(torch.nn.Module):
     def __init__(self, codebook_bits: int, embedding_dim: int):
         super().__init__()
-        raise NotImplementedError()
+        self._codebook_bits = codebook_bits
+        self._embedding_dim = embedding_dim
+
+        self.down = torch.nn.Linear(embedding_dim, codebook_bits, bias=True)
+        self.up   = torch.nn.Linear(codebook_bits, embedding_dim, bias=True)
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -55,15 +60,18 @@ class BSQ(torch.nn.Module):
         - L2 normalization
         - differentiable sign
         """
-        raise NotImplementedError()
+        y = self.down(x)                                # (..., m)
+        y = F.normalize(y, p=2, dim=-1, eps=1e-8)       # on unit sphere
+        c = diff_sign(y)                                # binary codes with STE
+        return c
 
     def decode(self, x: torch.Tensor) -> torch.Tensor:
         """
         Implement the BSQ decoder:
         - A linear up-projection into embedding_dim should suffice
         """
-        raise NotImplementedError()
-
+        return self.up(x)
+    
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.decode(self.encode(x))
 
@@ -97,19 +105,35 @@ class BSQPatchAutoEncoder(PatchAutoEncoder, Tokenizer):
 
     def __init__(self, patch_size: int = 5, latent_dim: int = 128, codebook_bits: int = 10):
         super().__init__(patch_size=patch_size, latent_dim=latent_dim)
-        raise NotImplementedError()
+        self.codebook_bits = codebook_bits
+        self.bsq = BSQ(embedding_dim=latent_dim, codebook_bits=codebook_bits)
 
-    def encode_index(self, x: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError()
+    def encode_index(self, x: torch.Tensor) -> torch.Tensor: # tokenizer
+        z = self.encode(x)                          # (B,h,w,D)
+        B, h, w, D = z.shape
+        c = self.bsq.encode_code(z.view(B, h*w, D)) # (B,L,bits)
+        idx = self.bsq.code_to_index(c)             # (B,L)
+        return idx.view(B, h, w)
 
-    def decode_index(self, x: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError()
+    def decode_index(self, x: torch.Tensor) -> torch.Tensor: # tokenizer
+        B, h, w = x.shape
+        c = self.bsq.index_to_code(x.view(B, h*w))      # (B,L,bits)
+        z = self.bsq.decode_code(c)                     # (B,L,D)
+        z = z.view(B, h, w, -1)                         # (B,h,w,D)
+        return self.decode(z)                            # (B,H,W,3)
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError()
+        return super().encode(x)
 
     def decode(self, x: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError()
+        if x.size(-1) == self.codebook_bits:
+            # treat as BSQ code
+            B, h, w, _ = x.shape
+            z = self.bsq.decode_code(x.view(B, h*w, -1)).view(B, h, w, -1)
+            return super().decode(z)
+        else:
+            # latent to image
+            return super().decode(x)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """
@@ -127,4 +151,25 @@ class BSQPatchAutoEncoder(PatchAutoEncoder, Tokenizer):
                 ...
               }
         """
-        raise NotImplementedError()
+        # --- Differentiable BSQ bottleneck path (uses STE) ---
+        z = super().encode(x)  # (B, h, w, D)
+        B, h, w, D = z.shape
+
+        c = self.bsq.encode_code(z.view(B, h * w, D)).view(B, h, w, self.codebook_bits)  # (B, h, w, bits)
+        x_rec = self.decode(c)  # (B, H, W, 3)
+
+        # --- Monitor codebook usage (token histogram) ---
+        with torch.no_grad():
+            tokens = self.encode_index(x).view(B, h * w)  # (B, L)
+            K = 2 ** self.codebook_bits
+            cnt = torch.bincount(tokens.flatten(), minlength=K)  # (K,)
+
+            logs = {
+                # Fractions of codes that are never / rarely used
+                "cb0": (cnt == 0).float().mean().detach(),
+                "cb2": (cnt <= 2).float().mean().detach(),
+                # optional extras:
+                "token_usage_frac": (cnt > 0).float().mean().detach(),  # how many codes ever used
+            }
+
+        return x_rec, logs
