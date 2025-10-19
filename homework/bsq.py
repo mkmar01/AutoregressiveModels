@@ -60,10 +60,10 @@ class BSQ(torch.nn.Module):
         - L2 normalization
         - differentiable sign
         """
-        y = self.down(x)                                # (..., m)
-        y = F.normalize(y, p=2, dim=-1, eps=1e-8)       # on unit sphere
-        c = diff_sign(y)                                # binary codes with STE
-        return c
+        y = self.down(x)                                           # (..., K)
+        y = y / (y.norm(dim=-1, keepdim=True) + 1e-6)             # (..., K), on unit sphere
+        y = diff_sign(y)                                           # (..., K), ±1 with STE
+        return y
 
     def decode(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -106,34 +106,28 @@ class BSQPatchAutoEncoder(PatchAutoEncoder, Tokenizer):
     def __init__(self, patch_size: int = 5, latent_dim: int = 128, codebook_bits: int = 10):
         super().__init__(patch_size=patch_size, latent_dim=latent_dim)
         self.codebook_bits = codebook_bits
+        self.latent_dim = latent_dim
         self.bsq = BSQ(embedding_dim=latent_dim, codebook_bits=codebook_bits)
 
     def encode_index(self, x: torch.Tensor) -> torch.Tensor: # tokenizer
-        z = self.encode(x)                          # (B,h,w,D)
-        B, h, w, D = z.shape
-        c = self.bsq.encode(z.view(B, h*w, D)) # (B,L,bits)
-        idx = self.bsq._code_to_index(c)             # (B,L)
-        return idx.view(B, h, w)
+        z = super().encode(x)                # (B, h, w, latent_dim)
+        idx = self.bsq.encode_index(z)       # (B, h, w)
+        return idx
 
     def decode_index(self, x: torch.Tensor) -> torch.Tensor: # tokenizer
-        B, h, w = x.shape
-        c = self.bsq._index_to_code(x.view(B, h*w))      # (B,L,bits)
-        z = self.bsq.decode(c)                     # (B,L,D)
-        z = z.view(B, h, w, -1)                         # (B,h,w,D)
-        return self.decode(z)                            # (B,H,W,3)
+        z = self.bsq.decode_index(x)         # (B, h, w, latent_dim)
+        x_rec = super().decode(z)            # (B, H, W, 3)
+        return x_rec                           # (B,H,W,3)
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
-        return super().encode(x)
+        z = super().encode(x)                # (B, h, w, latent_dim)
+        code = self.bsq.encode(z)            # (B, h, w, K)
+        return code
 
     def decode(self, x: torch.Tensor) -> torch.Tensor:
-        if x.size(-1) == self.codebook_bits:
-            # treat as BSQ code
-            B, h, w, _ = x.shape
-            z = self.bsq.decode(x.view(B, h*w, -1)).view(B, h, w, -1)
-            return super().decode(z)
-        else:
-            # latent to image
-            return super().decode(x)
+        z = self.bsq.decode(x)               # (B, h, w, latent_dim)
+        x_rec = super().decode(z)            # (B, H, W, 3)
+        return x_rec
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """
@@ -151,25 +145,30 @@ class BSQPatchAutoEncoder(PatchAutoEncoder, Tokenizer):
                 ...
               }
         """
-        # --- Differentiable BSQ bottleneck path (uses STE) ---
-        z = super().encode(x)  # (B, h, w, D)
-        B, h, w, D = z.shape
+        code = self.encode(x)                 # (B, h, w, K), ±1
+        x_rec = self.decode(code)             # (B, H, W, 3)
 
-        c = self.bsq.encode(z.view(B, h * w, D)).view(B, h, w, self.codebook_bits)  # (B, h, w, bits)
-        x_rec = self.decode(c)  # (B, H, W, 3)
-
-        # --- Monitor codebook usage (token histogram) ---
+        # ---- Diagnostics (no gradients) ----
         with torch.no_grad():
-            tokens = self.encode_index(x).view(B, h * w)  # (B, L)
-            K = 2 ** self.codebook_bits
-            cnt = torch.bincount(tokens.flatten(), minlength=K)  # (K,)
+            # Codebook usage over indices
+            idx = self.bsq._code_to_index(code)                                 # (B, h, w)
+            vocab = 2 ** self.codebook_bits
+            cnt = torch.bincount(idx.flatten(), minlength=vocab)
 
-            logs = {
-                # Fractions of codes that are never / rarely used
-                "cb0": (cnt == 0).float().mean().detach(),
-                "cb2": (cnt <= 2).float().mean().detach(),
-                # optional extras:
-                "token_usage_frac": (cnt > 0).float().mean().detach(),  # how many codes ever used
-            }
+            # Fraction of codes with 0, ≤1, ≤2 occurrences (lower is better)
+            cb0 = (cnt == 0).float().mean()
+            cb1 = (cnt <= 1).float().mean()
+            cb2 = (cnt <= 2).float().mean()
 
-        return x_rec, logs
+            # Bit-balance: ideally each bit is ~50/50; measure mean |mean(bit)|
+            bit_mean = code.mean(dim=(0, 1, 2))                                  # (K,)
+            bit_balance = bit_mean.abs().mean()                                  # scalar
+
+        extras = {
+            "cb0": cb0,
+            "cb1": cb1,
+            "cb2": cb2,
+            "bit_balance": bit_balance,
+        }
+
+        return x_rec, extras
