@@ -111,13 +111,13 @@ class BSQPatchAutoEncoder(PatchAutoEncoder, Tokenizer):
     def encode_index(self, x: torch.Tensor) -> torch.Tensor: # tokenizer
         z = self.encode(x)                          # (B,h,w,D)
         B, h, w, D = z.shape
-        c = self.bsq.encode_code(z.view(B, h*w, D)) # (B,L,bits)
-        idx = self.bsq.code_to_index(c)             # (B,L)
+        c = self.bsq.encode(z.view(B, h*w, D)) # (B,L,bits)
+        idx = self.bsq._code_to_index(c)             # (B,L)
         return idx.view(B, h, w)
 
     def decode_index(self, x: torch.Tensor) -> torch.Tensor: # tokenizer
         B, h, w = x.shape
-        c = self.bsq.index_to_code(x.view(B, h*w))      # (B,L,bits)
+        c = self.bsq._index_to_code(x.view(B, h*w))      # (B,L,bits)
         z = self.bsq.decode(c)                     # (B,L,D)
         z = z.view(B, h, w, -1)                         # (B,h,w,D)
         return self.decode(z)                            # (B,H,W,3)

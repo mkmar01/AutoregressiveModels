@@ -114,40 +114,41 @@ class PatchAutoEncoder(torch.nn.Module, PatchAutoEncoderBase):
 
         def __init__(self, patch_size: int, latent_dim: int, bottleneck: int):
             super().__init__()
-            self.patch = PatchifyLinear(patch_size, latent_dim)   # returns NHWC
-            self.conv = torch.nn.Sequential(
-              # operate in NCHW
-              torch.nn.Conv2d(latent_dim, bottleneck, 1),
-              torch.nn.GELU(),
-              torch.nn.Conv2d(bottleneck, bottleneck, 3, padding=1),
-              torch.nn.GELU(),
-            )
+            # Patchify to (B, C=latent_dim, h, w)
+            self.patch = torch.nn.Conv2d(3, latent_dim, kernel_size=patch_size, stride=patch_size, bias=False)
+            # Simple non-linear mixing across neighboring patches (3x3 on the patch-grid)
+            self.mix1 = torch.nn.Conv2d(latent_dim, latent_dim, kernel_size=3, padding=1, bias=True)
+            self.act1 = torch.nn.GELU()
+            # Project into bottleneck channels per patch
+            self.to_bottleneck = torch.nn.Conv2d(latent_dim, bottleneck, kernel_size=1, bias=True)
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:
-            x = self.patch(x)             # (B, h, w, latent_dim)  NHWC
-            x = x.permute(0, 3, 1, 2)     # -> (B, latent_dim, h, w) NCHW
-            x = self.conv(x)              # NCHW
-            x = x.permute(0, 2, 3, 1)     # -> (B, h, w, bottleneck) NHWC
-            return x
+            y = hwc_to_chw(x)               # (B, 3, H, W)
+            y = self.patch(y)               # (B, latent, h, w)
+            y = self.act1(self.mix1(y))     # (B, latent, h, w)
+            y = self.to_bottleneck(y)       # (B, bottleneck, h, w)
+            return chw_to_hwc(y)            # (B, h, w, bottleneck)
 
     class PatchDecoder(torch.nn.Module):
         def __init__(self, patch_size: int, latent_dim: int, bottleneck: int):
             super().__init__()
-            self.pre = torch.nn.Sequential(
-              torch.nn.Conv2d(bottleneck, latent_dim, 3, padding=1),
-              torch.nn.GELU(),
-            )
-            self.unpatch = UnpatchifyLinear(patch_size, latent_dim)
+            # Expand from bottleneck back to latent channels on the patch grid
+            self.from_bottleneck = torch.nn.Conv2d(bottleneck, latent_dim, kernel_size=1, bias=True)
+            self.act1 = torch.nn.GELU()
+            self.mix1 = torch.nn.Conv2d(latent_dim, latent_dim, kernel_size=3, padding=1, bias=True)
+            # Unpatchify back to image space
+            self.unpatch = torch.nn.ConvTranspose2d(latent_dim, 3, kernel_size=patch_size, stride=patch_size, bias=False)
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:
-            x = x.permute(0, 3, 1, 2)     # -> NCHW
-            x = self.pre(x)               # (B, latent_dim, h, w)
-            x = x.permute(0, 2, 3, 1)     # -> NHWC
-            x = self.unpatch(x)           # -> (B, H, W, 3) NHWC
-            return x
+            y = hwc_to_chw(x)               # (B, bottleneck, h, w)
+            y = self.act1(self.from_bottleneck(y))  # (B, latent, h, w)
+            y = self.act1(self.mix1(y))     # (B, latent, h, w)
+            y = self.unpatch(y)             # (B, 3, H, W)
+            return chw_to_hwc(y)            # (B, H, W, 3)
 
     def __init__(self, patch_size: int = 25, latent_dim: int = 128, bottleneck: int = 128):
         super().__init__()
+        self.patch_size = patch_size
         self.encoder = self.PatchEncoder(patch_size, latent_dim, bottleneck)
         self.decoder = self.PatchDecoder(patch_size, latent_dim, bottleneck)
 
