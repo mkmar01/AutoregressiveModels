@@ -118,7 +118,7 @@ class BSQPatchAutoEncoder(PatchAutoEncoder, Tokenizer):
     def decode_index(self, x: torch.Tensor) -> torch.Tensor: # tokenizer
         B, h, w = x.shape
         c = self.bsq.index_to_code(x.view(B, h*w))      # (B,L,bits)
-        z = self.bsq.decode_code(c)                     # (B,L,D)
+        z = self.bsq.decode(c)                     # (B,L,D)
         z = z.view(B, h, w, -1)                         # (B,h,w,D)
         return self.decode(z)                            # (B,H,W,3)
 
@@ -129,7 +129,7 @@ class BSQPatchAutoEncoder(PatchAutoEncoder, Tokenizer):
         if x.size(-1) == self.codebook_bits:
             # treat as BSQ code
             B, h, w, _ = x.shape
-            z = self.bsq.decode_code(x.view(B, h*w, -1)).view(B, h, w, -1)
+            z = self.bsq.decode(x.view(B, h*w, -1)).view(B, h, w, -1)
             return super().decode(z)
         else:
             # latent to image
@@ -155,7 +155,7 @@ class BSQPatchAutoEncoder(PatchAutoEncoder, Tokenizer):
         z = super().encode(x)  # (B, h, w, D)
         B, h, w, D = z.shape
 
-        c = self.bsq.encode_code(z.view(B, h * w, D)).view(B, h, w, self.codebook_bits)  # (B, h, w, bits)
+        c = self.bsq.encode(z.view(B, h * w, D)).view(B, h, w, self.codebook_bits)  # (B, h, w, bits)
         x_rec = self.decode(c)  # (B, H, W, 3)
 
         # --- Monitor codebook usage (token histogram) ---
