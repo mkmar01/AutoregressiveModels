@@ -1,7 +1,6 @@
 import abc
-
 import torch
-
+import torch.nn as nn
 
 def load() -> torch.nn.Module:
     from pathlib import Path
@@ -55,10 +54,50 @@ class AutoregressiveModel(torch.nn.Module, Autoregressive):
 
     def __init__(self, d_latent: int = 128, n_tokens: int = 2**10):
         super().__init__()
-        raise NotImplementedError()
+        self.d_latent = d_latent
+        self.n_tokens = n_tokens
+        self.token_embedding = nn.Embedding(n_tokens, d_latent)
+        self.transformer_layer = nn.TransformerEncoderLayer(
+            d_model=d_latent,
+            nhead=8, 
+            dim_feedforward=4 * d_latent, 
+            activation='gelu', 
+            batch_first=False,
+            norm_first=True
+        )
+        self.encoder = nn.TransformerEncoder(self.transformer_layer, num_layers=4)
+        self.output_layer = nn.Linear(d_latent, n_tokens)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        raise NotImplementedError()
+        B, h, w = x.shape
+        seq_len = h * w
+
+        # Flatten input and embed tokens
+        x_flat = x.view(B, seq_len)  # (B, seq_len)
+        x_embedded = self.token_embedding(x_flat)  # (B, seq_len, d_latent)
+
+        # Shift input by one position
+        start_token = torch.zeros((B, 1, self.d_latent), device=x.device)  # (B, 1, d_latent)
+        x_shifted = torch.cat([start_token, x_embedded[:, :-1, :]], dim=1)  # (B, seq_len, d_latent)
+
+        # Permute for transformer input
+        x_permuted = x_shifted.permute(0, 1) # (seq_len, B, d_latent)
+
+        mask = torch.nn.Transformer.generate_square_subsequent_mask(seq_len).to(x.device) # (seq_len, seq_len)
+
+        # Pass through transformer encoder
+        transformer_output = self.encoder(x_permuted, mask=mask)  # (seq_len, B, d_latent)
+
+        # Permute back
+        transformer_output = transformer_output.transpose(0, 1)  # (B, seq_len, d_latent)
+
+        # Output layer to get logits for each token
+        logits = self.output_layer(transformer_output)  # (B, seq_len, n_tokens)
+
+        # Reshape logits to (B, h, w, n_tokens)
+        logits_reshaped = logits.view(B, h, w, self.n_tokens)  # (B, h, w, n_tokens)
+
+        return logits_reshaped, {}
 
     def generate(self, B: int = 1, h: int = 30, w: int = 20, device=None) -> torch.Tensor:  # noqa
         raise NotImplementedError()
