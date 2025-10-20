@@ -1,6 +1,8 @@
 import abc
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import math
 
 def load() -> torch.nn.Module:
     from pathlib import Path
@@ -57,6 +59,7 @@ class AutoregressiveModel(torch.nn.Module, Autoregressive):
         self.d_latent = d_latent
         self.n_tokens = n_tokens
         self.token_embedding = nn.Embedding(n_tokens, d_latent)
+        self.pos_emb = nn.Embedding(2048, d_latent)
         self.transformer_layer = nn.TransformerEncoderLayer(
             d_model=d_latent,
             nhead=8, 
@@ -65,8 +68,9 @@ class AutoregressiveModel(torch.nn.Module, Autoregressive):
             batch_first=False,
             norm_first=True
         )
-        self.encoder = nn.TransformerEncoder(self.transformer_layer, num_layers=4)
+        self.encoder = nn.TransformerEncoder(self.transformer_layer, num_layers=3)
         self.output_layer = nn.Linear(d_latent, n_tokens)
+        self.start_vec = nn.Parameter(torch.randn(1, 1, d_latent) / math.sqrt(d_latent))
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         B, h, w = x.shape
@@ -77,11 +81,14 @@ class AutoregressiveModel(torch.nn.Module, Autoregressive):
         x_embedded = self.token_embedding(x_flat)  # (B, seq_len, d_latent)
 
         # Shift input by one position
-        start_token = torch.zeros((B, 1, self.d_latent), device=x.device)  # (B, 1, d_latent)
+        start_token = self.start_vec.expand(B, 1, self.d_latent)  # (B, 1, d_latent)
         x_shifted = torch.cat([start_token, x_embedded[:, :-1, :]], dim=1)  # (B, seq_len, d_latent)
 
+        pos_ids = torch.arange(seq_len, device=x.device).unsqueeze(0)  # (1, S)
+        x_shifted = x_shifted + self.pos_emb(pos_ids)
+
         # Permute for transformer input
-        x_permuted = x_shifted.permute(0, 1) # (seq_len, B, d_latent)
+        x_permuted = x_shifted.transpose(0, 1) # (seq_len, B, d_latent)
 
         mask = torch.nn.Transformer.generate_square_subsequent_mask(seq_len).to(x.device) # (seq_len, seq_len)
 
@@ -100,4 +107,14 @@ class AutoregressiveModel(torch.nn.Module, Autoregressive):
         return logits_reshaped, {}
 
     def generate(self, B: int = 1, h: int = 30, w: int = 20, device=None) -> torch.Tensor:  # noqa
-        raise NotImplementedError()
+        self.eval()
+        seq_len = h * w
+        generated = torch.zeros((B, seq_len), dtype=torch.long, device=device)
+
+        for t in range(seq_len):
+            logits, _ = self.forward(generated.view(B, h, w))
+            probs = F.softmax(logits[:, t // w, t % w, :], dim=-1)  # (B, n_tokens)
+            next_token = torch.multinomial(probs, num_samples=1).squeeze(-1)  # (B,)
+            generated[:, t] = next_token
+
+        return generated.view(B, h, w)
